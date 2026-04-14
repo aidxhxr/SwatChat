@@ -13,15 +13,18 @@ services:
       - "5433:5432"
 
   rag_api:
-    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev:latest
+    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
     environment:
       - DB_HOST=vectordb
       - DB_PORT=5432
       - POSTGRES_DB=mydatabase
       - POSTGRES_USER=myuser
       - POSTGRES_PASSWORD=mypassword
+      - EMBEDDINGS_PROVIDER=huggingface
+      - EMBEDDINGS_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      - RAG_PORT=8000
     ports:
-      - "${RAG_PORT}:${RAG_PORT}"
+      - "8000:8000"
     depends_on:
       - vectordb
     env_file:
