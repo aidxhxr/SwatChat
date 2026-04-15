@@ -1,5 +1,11 @@
 ### node etc ###
 
+# NFS temporary files (never commit — may contain secrets)
+.nfs*
+
+# Ingestion progress tracking
+.ingest_progress.json
+
 # Logs
 data-node
 meili_data*

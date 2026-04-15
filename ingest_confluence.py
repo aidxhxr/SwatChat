@@ -1,44 +1,24 @@
-"""
-Bulk-ingests all .txt files from data_confluence into the LibreChat RAG API,
-associated with a specific Agent so every user of that agent can search them.
-
-Usage:
-    python ingest_confluence.py \
-        --email admin@example.com \
-        --password yourpassword \
-        --agent-id <agent_id_from_librechat_ui>
-
-Requirements:
-    pip install requests
-
-Steps before running:
-    1. Create an Agent in LibreChat (Agents > New Agent):
-       - Model: Qwen3.5-27B.Q5_K_M.gguf  (SwatGPT endpoint)
-       - Enable "File Search" capability
-       - Save and copy the agent ID from the URL or agent details
-    2. Restart the LibreChat backend so it picks up RAG_API_URL from .env
-    3. Run this script
-"""
-
 import argparse
 import json
-import os
 import uuid
 import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 LIBRECHAT_URL = "http://localhost:3080"
 DATA_DIR = Path(__file__).parent / "data_confluence"
 PROGRESS_FILE = Path(__file__).parent / ".ingest_progress.json"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 
 def login(email: str, password: str) -> str:
     resp = requests.post(
         f"{LIBRECHAT_URL}/api/auth/login",
         json={"email": email, "password": password},
+        headers={"User-Agent": BROWSER_UA},
         timeout=15,
     )
     if resp.status_code != 200:
@@ -52,25 +32,27 @@ def login(email: str, password: str) -> str:
     return token
 
 
-def upload_file(token: str, agent_id: str, file_path: Path) -> bool:
+def upload_file(token: str, agent_id: str, file_path: Path) -> tuple[Path, bool, str]:
     file_id = str(uuid.uuid4())
-    with open(file_path, "rb") as f:
-        resp = requests.post(
-            f"{LIBRECHAT_URL}/api/files",
-            headers={"Authorization": f"Bearer {token}"},
-            data={
-                "file_id": file_id,
-                "endpoint": "agents",
-                "agent_id": agent_id,
-                "tool_resource": "file_search",
-            },
-            files={"file": (file_path.name, f, "text/plain")},
-            timeout=60,
-        )
-    if resp.status_code in (200, 201):
-        return True
-    print(f"  FAILED ({resp.status_code}): {resp.text[:200]}")
-    return False
+    try:
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                f"{LIBRECHAT_URL}/api/files",
+                headers={"Authorization": f"Bearer {token}", "User-Agent": BROWSER_UA},
+                data={
+                    "file_id": file_id,
+                    "endpoint": "agents",
+                    "agent_id": agent_id,
+                    "tool_resource": "file_search",
+                },
+                files={"file": (file_path.name, f, "text/plain")},
+                timeout=60,
+            )
+        if resp.status_code in (200, 201) and "Illegal" not in resp.text:
+            return file_path, True, ""
+        return file_path, False, f"({resp.status_code}): {resp.text[:120]}"
+    except Exception as e:
+        return file_path, False, str(e)
 
 
 def load_progress() -> set:
@@ -85,10 +67,10 @@ def save_progress(done: set) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Ingest confluence docs into LibreChat RAG")
-    parser.add_argument("--email", required=True, help="LibreChat admin email")
-    parser.add_argument("--password", required=True, help="LibreChat admin password")
-    parser.add_argument("--agent-id", required=True, help="LibreChat Agent ID to associate files with")
-    parser.add_argument("--delay", type=float, default=0.3, help="Seconds between uploads (default: 0.3)")
+    parser.add_argument("--email", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument("--agent-id", required=True)
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent uploads (default: 8)")
     args = parser.parse_args()
 
     token = login(args.email, args.password)
@@ -102,23 +84,29 @@ def main():
 
     success = 0
     failed = 0
-    for i, path in enumerate(remaining, 1):
-        rel = path.relative_to(DATA_DIR)
-        print(f"[{i}/{len(remaining)}] {rel} ... ", end="", flush=True)
-        ok = upload_file(token, args.agent_id, path)
-        if ok:
-            print("OK")
-            done.add(str(path))
-            success += 1
-        else:
-            failed += 1
-        if i % 20 == 0:
-            save_progress(done)
-        if args.delay > 0:
-            time.sleep(args.delay)
+    start = time.time()
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(upload_file, token, args.agent_id, f): f
+            for f in remaining
+        }
+        for i, future in enumerate(as_completed(futures), 1):
+            path, ok, err = future.result()
+            rel = path.relative_to(DATA_DIR)
+            if ok:
+                done.add(str(path))
+                success += 1
+                print(f"[{i}/{len(remaining)}] OK  {rel}")
+            else:
+                failed += 1
+                print(f"[{i}/{len(remaining)}] FAIL {rel} — {err}")
+            if i % 20 == 0:
+                save_progress(done)
 
     save_progress(done)
-    print(f"\nDone. Success: {success} | Failed: {failed} | Total ingested: {len(done)}")
+    elapsed = time.time() - start
+    print(f"\nDone in {elapsed:.0f}s. Success: {success} | Failed: {failed} | Total: {len(done)}")
 
 
 if __name__ == "__main__":
